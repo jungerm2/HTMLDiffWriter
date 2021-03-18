@@ -1,7 +1,8 @@
 import uuid
+from functools import partial
+from multiprocessing import Pool
 from difflib import SequenceMatcher
 from matplotlib.animation import HTMLWriter, _log
-
 
 # Javascript template for HTMLWriter
 JS_INCLUDE = """
@@ -25,7 +26,7 @@ href="https://maxcdn.bootstrapcdn.com/font-awesome/4.4.0/css/font-awesome.min.cs
     this.num_frames = diff_frames.length + 1;
     this.diff_frames = diff_frames;
     this.checkpoint_frames = checkpoint_frames;
-    
+
     var slider = document.getElementById(this.slider_id);
     slider.max = this.num_frames - 1;
     if (isInternetExplorer()) {
@@ -67,7 +68,7 @@ href="https://maxcdn.bootstrapcdn.com/font-awesome/4.4.0/css/font-awesome.min.cs
         base = applyPatch(base, this.diff_frames[i]);
       }
     }
-    
+
     this.current_frame = frame;
     document.getElementById(this.img_id).src = base;
     document.getElementById(this.slider_id).value = this.current_frame;
@@ -162,7 +163,7 @@ href="https://maxcdn.bootstrapcdn.com/font-awesome/4.4.0/css/font-awesome.min.cs
         t.anim_step_reverse();
     }, this.interval);
   }
-  
+
   /**
   * Apply the diff patch to the input string
   * @param {string} base
@@ -197,7 +198,6 @@ href="https://maxcdn.bootstrapcdn.com/font-awesome/4.4.0/css/font-awesome.min.cs
 </script>
 """
 
-
 # Style definitions for the HTML template
 STYLE_INCLUDE = """
 <style>
@@ -226,7 +226,6 @@ input[type=range].anim-slider {
 }
 </style>
 """
-
 
 # HTML template for HTMLWriter
 DISPLAY_TEMPLATE = """
@@ -277,7 +276,7 @@ DISPLAY_TEMPLATE = """
     var img_id = "_anim_img{id}";
     var slider_id = "_anim_slider{id}";
     var loop_select_id = "_anim_loop_select{id}";
-    
+
     var diff_frames = new Array({Ndiffs});
     {diff_frames}
     var checkpoint_frames = new Object();
@@ -317,12 +316,18 @@ def _diff_frames(frame1, frame2):
     return diff
 
 
-def _embedded_diff_frames(frames):
-    diffs = []
+def _embedded_diff_frames(frames, parallel=False):
+    frame_pairs = []
     prev_frame = frames[0]
     for next_frame in frames[1:]:
-        diffs.append(_diff_frames(prev_frame, next_frame))
+        frame_pairs.append((prev_frame, next_frame))
         prev_frame = next_frame
+
+    if parallel:
+        with Pool() as p:
+            diffs = p.starmap(_diff_frames, frame_pairs)
+    else:
+        diffs = [_diff_frames(*fp) for fp in frame_pairs]
 
     template = '    diff_frames[{0}] = {1}\n'
     return "\n" + "".join(
@@ -331,6 +336,10 @@ def _embedded_diff_frames(frames):
 
 
 class HTMLDiffWriter(HTMLWriter):
+    def __init__(self, *args, parallel=True, **kwargs):
+        self.parallel = parallel
+        super().__init__(*args, **kwargs)
+
     def finish(self):
         # save the frames to an html file
         if self.embed_frames:
@@ -338,7 +347,7 @@ class HTMLDiffWriter(HTMLWriter):
             prefixed_frames = [frame.replace('\n', '') for frame in self._saved_frames]
             prefixed_frames = _add_base64_prefix(prefixed_frames, self.frame_format)
             fill_frames = _embedded_checkpoint_frames({0: prefixed_frames[0]})
-            diff_frames = _embedded_diff_frames(prefixed_frames)
+            diff_frames = _embedded_diff_frames(prefixed_frames, parallel=self.parallel)
             Ndiffs = len(self._saved_frames) - 1
         else:
             raise NotImplementedError('Only embedded frames are supported at the moment')
