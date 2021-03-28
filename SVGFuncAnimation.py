@@ -5,7 +5,6 @@ import xml.etree.ElementTree as ET
 from io import StringIO
 
 from matplotlib.artist import Artist
-from matplotlib.text import Text
 
 
 # Javascript template for HTMLWriter
