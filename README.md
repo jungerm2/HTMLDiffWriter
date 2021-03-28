@@ -18,7 +18,7 @@ This new ID the allows us to find the correct SVG tag and keep track of all arti
 
 ### Demo:
 
-SVGFuncAnimation is much faster and more memory efficient than it's FuncAnimation counter:
+SVGFuncAnimation is much faster and more memory efficient than it's FuncAnimation counterpart:
 
 ![benchmark picture](svgfuncanim_benchmark.png)
 
