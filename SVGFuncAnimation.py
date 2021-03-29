@@ -281,7 +281,8 @@ class SVGFuncAnimation:
         self._interval = interval
         self._html_representation = ''
         self._base_document = None
-        self._embed_frames = []
+        self._embedded_frames = []
+        self._defs = []
 
     @staticmethod
     def _tree_tostring(tree):
@@ -290,64 +291,18 @@ class SVGFuncAnimation:
         return ET.tostring(tree, encoding='unicode')
 
     @staticmethod
-    def _recursive_remove(root, xpath, ns):
+    def _recursive_remove(root, xpath, ns=None):
         for child in root.findall(xpath, ns):
             root.remove(child)
 
         for child in list(root):
             SVGFuncAnimation._recursive_remove(child, xpath, ns)
 
-    def _gather_defs(self):
-        # SVG definitions (i.e: <defs>) are generated on the fly by each artist if they
-        # haven't yet been created. Therefore we need to gather them and place them
-        # in the base document such that every frame has access to them.
-        # Note: This step could be improved. Currently it depends on python's builtin
-        # XML library which cannot handle XML chunks so we need to hack together a
-        # valid doc for it to parse, then remove the excess (see below).
-
-        # Find the first <defs> in the base document and add all defs to it
-        base_document_tree = ET.fromstring(self._base_document)
-        defs = []
-
-        # Gather all defs from the base document that isn't the main defs
-        for ds in base_document_tree.findall('.//*/svg:defs', self.NAMESPACES):
-            defs.append(ds)
-
-        # Purge all defs from main document
-        for child in list(base_document_tree):
-            self._recursive_remove(child, 'svg:defs', self.NAMESPACES)
-
-        # Now filter through the embedded frames and remove any defs in those
-        filtered_frames = []
-        start, end = '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">', '</svg>'
-
-        for embedded_frame in self._embed_frames:
-            drawn_artists = {}
-            for gid, doc in embedded_frame.items():
-                # Make the doc a valid XML file, otherwise we can't parse it
-                doc = start + doc + end
-                doc = ET.fromstring(doc)
-                for ds in doc.findall('.//*/svg:defs', self.NAMESPACES):
-                    defs.append(ds)
-                self._recursive_remove(doc, 'svg:defs', self.NAMESPACES)
-                # We can't simply do _tree_tostring on the doc's (only) child, because
-                # the XML package will add namespace info to that child... It's annoying
-                drawn_artists[gid] = self._tree_tostring(doc).replace(start, '', 1).replace(end, '', 1)
-            filtered_frames.append(drawn_artists)
-        self._embed_frames = filtered_frames
-
-        # Add all defs to main_def, regenerate the base doc
-        main_defs = ET.SubElement(base_document_tree, 'defs')
-        for d in defs:
-            for child in list(d):
-                main_defs.append(child)
-
-        self._base_document = self._tree_tostring(base_document_tree)
-
     def grab_frames(self):
         # Clear previous data
         self._base_document = None
-        self._embed_frames = []
+        self._embedded_frames = []
+        self._defs = []
 
         with StringIO() as f:
             # Init figure by adding all artists returned by init_func
@@ -398,9 +353,49 @@ class SVGFuncAnimation:
                     self._fig.draw_artist(artist)
                     f.seek(start_pos)
                     drawn_artist = f.read()
+
+                    # SVG definitions (i.e: <defs>) are generated on the fly by each artist if they
+                    # haven't yet been created. Therefore we need to gather them and place them
+                    # in the base document such that every frame has access to them.
+                    # Note, we need to strip the xlink namespace otherwise
+                    # this isn't a valid document and we can't process it.
+                    drawn_artist = ET.fromstring(drawn_artist.replace('xlink:href', 'href'))
+                    self._defs.extend(drawn_artist.findall('.//defs'))
+                    self._recursive_remove(drawn_artist, 'defs')
+                    drawn_artist = self._tree_tostring(drawn_artist).replace('href', 'xlink:href')
+
                     drawn_artists[artist_gid] = drawn_artist
-                self._embed_frames.append(drawn_artists)
-        self._gather_defs()
+                self._embedded_frames.append(drawn_artists)
+
+        # Gather all defs from the base document
+        base_document_tree = ET.fromstring(self._base_document)
+        self._defs.extend(base_document_tree.findall('.//*/svg:defs', self.NAMESPACES))
+
+        # Purge all defs from main document
+        for child in list(base_document_tree):
+            self._recursive_remove(child, 'svg:defs', self.NAMESPACES)
+
+        # Add all defs to a single "main" def, regenerate the base doc
+        main_defs = ET.SubElement(base_document_tree, 'defs')
+        for d in self._defs:
+            for child in list(d):
+                main_defs.append(child)
+        self._base_document = self._tree_tostring(base_document_tree)
+
+    def grab_frame(self, index):
+        if not self._base_document:
+            self.grab_frames()
+
+        base = ET.fromstring(self._base_document)
+
+        for gid, data in self._embedded_frames[index].items():
+            doc = ET.fromstring(data)
+            match = base.findall(f'.//*[@id="{gid}"]')[0]
+            for child in list(match):
+                match.remove(child)
+            for child in list(doc):
+                match.append(child)
+        return self._tree_tostring(base)
 
     def save(self, filename):
         if not self._base_document:
@@ -412,8 +407,8 @@ class SVGFuncAnimation:
         with open(filename, 'w', encoding='utf-8') as of:
             of.write(JS_INCLUDE + STYLE_INCLUDE)
             of.write(DISPLAY_TEMPLATE.format(id=uuid.uuid4().hex,
-                                             Nframes=len(self._embed_frames),
-                                             fill_frames=self._embed_frames,
+                                             Nframes=len(self._embedded_frames),
+                                             fill_frames=self._embedded_frames,
                                              base_document=self._base_document,
                                              interval=self._interval,
                                              **mode_dict))
