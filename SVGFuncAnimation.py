@@ -1,9 +1,12 @@
 import uuid
 from pathlib import Path
+from html import unescape
+from xml.dom import minidom
+from functools import lru_cache
 from tempfile import TemporaryDirectory
-import xml.etree.ElementTree as ET
 from io import StringIO
 
+from matplotlib.backends.backend_svg import MixedModeRenderer, RendererSVG, XMLWriter, svgProlog
 from matplotlib.artist import Artist
 
 
@@ -266,11 +269,6 @@ def get_all_children(artist):
 
 
 class SVGFuncAnimation:
-    NAMESPACES = {
-        'svg': 'http://www.w3.org/2000/svg',
-        'xlink': 'http://www.w3.org/1999/xlink'
-    }
-
     def __init__(self, fig, func, frames, init_func=None, fargs=None, default_mode='loop', interval=200):
         self._fig = fig
         self._func = func
@@ -282,27 +280,32 @@ class SVGFuncAnimation:
         self._html_representation = ''
         self._base_document = None
         self._embedded_frames = []
-        self._defs = []
+        self._vector_renderer = None
+        self._renderer = None
 
     @staticmethod
-    def _tree_tostring(tree):
-        ET.register_namespace('', 'http://www.w3.org/2000/svg')
-        ET.register_namespace('xlink', 'http://www.w3.org/1999/xlink')
-        return ET.tostring(tree, encoding='unicode')
+    def _find_by_attr(dom, value, attr='id', return_child=True):
+        for index, child in enumerate(dom.childNodes):
+            if isinstance(child, minidom.Element):
+                if child.getAttribute(attr) == value:
+                    if return_child:
+                        return child
+                    return index, dom
+                else:
+                    retval = SVGFuncAnimation._find_by_attr(
+                        child, value, attr=attr,
+                        return_child=return_child
+                    )
+                    if retval:
+                        return retval
 
-    @staticmethod
-    def _recursive_remove(root, xpath, ns=None):
-        for child in root.findall(xpath, ns):
-            root.remove(child)
-
-        for child in list(root):
-            SVGFuncAnimation._recursive_remove(child, xpath, ns)
-
+    @lru_cache
     def grab_frames(self):
         # Clear previous data
         self._base_document = None
         self._embedded_frames = []
-        self._defs = []
+        self._vector_renderer = None
+        self._renderer = None
 
         with StringIO() as f:
             # Init figure by adding all artists returned by init_func
@@ -322,17 +325,26 @@ class SVGFuncAnimation:
 
             # Now we can save the initial figure, this creates a cached
             # SVG rendered, and will produce our base SVG document
-            self._fig.savefig(f, format='svg')
-            f.seek(0)
-            self._base_document = f.read()
+            dpi = self._fig.get_dpi()
+            self._fig.set_dpi(72)
+            width, height = self._fig.get_size_inches()
+            w, h = width * 72, height * 72
+
+            self._vector_renderer = RendererSVG(w, h, f, None, dpi)
+            self._renderer = MixedModeRenderer(
+                self._fig, width, height, dpi,
+                self._vector_renderer)
+
+            self._fig.draw(self._renderer)
+            base_writer = self._vector_renderer.writer
+            # self._renderer.finalize()
 
             # Read this document and parse out all SVG groups.
             # This will help us detect if an artist that we haven't
             # encountered before gets drawn. These artists are problematic
             # because the SVG group associated with them won't be in the
             # base document so we won't be able to update it properly.
-            tree = ET.fromstring(self._base_document)
-            known_groups = {g.get('id') for g in tree.findall('.//*/svg:g', namespaces=self.NAMESPACES)}
+            known_groups = self._vector_renderer._groupids
 
             # Get all subsequent frames by only drawing
             # the artists returned by the user's func
@@ -349,58 +361,33 @@ class SVGFuncAnimation:
                     # Note that there's some real "blitting" potential here,
                     # We could figure out if the artist data changed at all
                     # and not redraw if it didn't, for now let's redraw all.
-                    start_pos = f.tell()
-                    self._fig.draw_artist(artist)
-                    f.seek(start_pos)
-                    drawn_artist = f.read()
+                    with StringIO() as artist_f:
+                        writer = XMLWriter(artist_f)
+                        self._vector_renderer.writer = writer
 
-                    # SVG definitions (i.e: <defs>) are generated on the fly by each artist if they
-                    # haven't yet been created. Therefore we need to gather them and place them
-                    # in the base document such that every frame has access to them.
-                    # Note, we need to strip the xlink namespace otherwise
-                    # this isn't a valid document and we can't process it.
-                    drawn_artist = ET.fromstring(drawn_artist.replace('xlink:href', 'href'))
-                    self._defs.extend(drawn_artist.findall('.//defs'))
-                    self._recursive_remove(drawn_artist, 'defs')
-                    drawn_artist = self._tree_tostring(drawn_artist).replace('href', 'xlink:href')
+                        self._fig.draw_artist(artist)
+                        drawn_artist = artist_f.getvalue()
 
                     drawn_artists[artist_gid] = drawn_artist
                 self._embedded_frames.append(drawn_artists)
 
-        # Gather all defs from the base document
-        base_document_tree = ET.fromstring(self._base_document)
-        self._defs.extend(base_document_tree.findall('.//*/svg:defs', self.NAMESPACES))
+            self._vector_renderer.writer = base_writer
+            self._renderer.finalize()
 
-        # Purge all defs from main document
-        for child in list(base_document_tree):
-            self._recursive_remove(child, 'svg:defs', self.NAMESPACES)
-
-        # Add all defs to a single "main" def, regenerate the base doc
-        main_defs = ET.SubElement(base_document_tree, 'defs')
-        for d in self._defs:
-            for child in list(d):
-                main_defs.append(child)
-        self._base_document = self._tree_tostring(base_document_tree)
+            self._base_document = f.getvalue()
 
     def grab_frame(self, index):
-        if not self._base_document:
-            self.grab_frames()
-
-        base = ET.fromstring(self._base_document)
-
+        self.grab_frames()
+        # Note: we use minidom instead of etree as etree messes up the namespaces
+        base = minidom.parseString(self._base_document)
         for gid, data in self._embedded_frames[index].items():
-            doc = ET.fromstring(data)
-            match = base.findall(f'.//*[@id="{gid}"]')[0]
-            for child in list(match):
-                match.remove(child)
-            for child in list(doc):
-                match.append(child)
-        return self._tree_tostring(base)
+            index, parent = self._find_by_attr(base, gid, return_child=False)
+            # Slightly abuse text nodes to inject XML chunks into doc (requires unescaping)
+            parent.childNodes[index] = base.createTextNode(data)
+        return unescape(base.toxml())
 
     def save(self, filename):
-        if not self._base_document:
-            self.grab_frames()
-
+        self.grab_frames()
         mode_dict = dict(once_checked='', loop_checked='', reflect_checked='')
         mode_dict[self._default_mode + '_checked'] = 'checked'
 
