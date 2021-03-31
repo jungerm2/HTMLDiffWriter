@@ -25,6 +25,10 @@ SVGFuncAnimation is much faster and more memory efficient than it's FuncAnimatio
 Please see [svgfuncanim](svgfuncanim.ipynb) for a quick demo, and [this](svgfuncanim_benchmark.ipynb) to see 
 how the above was generated.
 
+_*Note:*_ Currently `SVGFuncAnimation` relies on a few small tweaks in the matplotlib's SVG backend which can be found 
+on [my fork of matplotlib](https://github.com/jungerm2/matplotlib). I do plan on merging these if this feature gets 
+accepted.
+
 ### Current Limitations:
 
 This is still a WIP, so these are subject to change, but currently, one of the main limitations of `SVGFuncAnimation` is 
