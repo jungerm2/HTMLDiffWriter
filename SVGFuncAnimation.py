@@ -269,7 +269,7 @@ def get_all_children(artist):
 
 
 class SVGFuncAnimation:
-    def __init__(self, fig, func, frames, init_func=None, fargs=None, default_mode='loop', interval=200):
+    def __init__(self, fig, func, frames, init_func=None, fargs=None, default_mode='loop', interval=200, blit=True):
         self._fig = fig
         self._func = func
         self._iter_gen = frames  # TODO: Deal with integers, and generators (with itertools.tee?)
@@ -277,6 +277,7 @@ class SVGFuncAnimation:
         self._args = fargs if fargs else ()
         self._default_mode = default_mode
         self._interval = interval
+        self._blit = blit
         self._html_representation = ''
         self._base_document = None
         self._embedded_frames = []
@@ -285,6 +286,9 @@ class SVGFuncAnimation:
 
     @staticmethod
     def _find_by_attr(dom, value, attr='id', return_child=True):
+        # this could be done better with a more advanced XML parser but has been
+        # done like so to minimize external dependencies. ElementTree re-writes
+        # and changes the namespaces so we use minidom instead.
         for index, child in enumerate(dom.childNodes):
             if isinstance(child, minidom.Element):
                 if child.getAttribute(attr) == value:
@@ -299,6 +303,29 @@ class SVGFuncAnimation:
                     if retval:
                         return retval
 
+    def _validate_artists(self, artists, name='animation function'):
+        # Both `_init_func` and `_func` should return an iterable of artists
+        # if blit is True. Otherwise the return value is not used.
+        if self._blit:
+            err = RuntimeError(f'The {name} must return a sequence '
+                               'of Artist objects.')
+            try:
+                # check if a sequence
+                iter(artists)
+            except TypeError:
+                raise err from None
+
+            # check each item if is artist
+            for i in artists:
+                if not isinstance(i, Artist):
+                    raise err
+
+            # for a in artists:
+            #     a.set_animated(self._blit)
+
+            return sorted(artists, key=lambda x: x.get_zorder())
+        return []
+
     @lru_cache
     def grab_frames(self):
         # Clear previous data
@@ -309,22 +336,23 @@ class SVGFuncAnimation:
 
         with StringIO() as f:
             # Init figure by adding all artists returned by init_func
-            # TODO: Check that these are actually artists
             if self._init_func:
-                for artist in self._init_func():
+                init_artists = self._init_func()
+                init_artists = self._validate_artists(init_artists, name='init_func')
+                for artist in init_artists:
                     self._fig.add_artist(artist)
-                    # artist.set_visible(True)
+                    artist.set_visible(True)
 
-            # Set the gid of every artist to it's hash, the idea here is that
+            # Set the gid of every artist to a uuid, the idea here is that
             # when an artist is drawn in SVG it will be encased in a group with
-            # an id equal to the artist's gid and the hash of an artist doesn't
+            # an id equal to the artist's gid and the gid of an artist doesn't
             # change when the artist's data changes.
             for artist in get_all_children(self._fig):
-                # artist.set_gid(str(hash(artist)))
-                artist.set_gid(uuid.uuid4().hex)
+                artist.set_gid(f'{artist.__class__.__name__}_{uuid.uuid4().hex}')
 
-            # Now we can save the initial figure, this creates a cached
-            # SVG rendered, and will produce our base SVG document
+            # Now we can save the initial figure, without finalizing it's renderer.
+            # This keeps the renderer._defs from being written until we know all of them.
+            # Also keep a ref to the writer in order to swap it out for each artist redraw.
             dpi = self._fig.get_dpi()
             self._fig.set_dpi(72)
             width, height = self._fig.get_size_inches()
@@ -337,10 +365,8 @@ class SVGFuncAnimation:
 
             self._fig.draw(self._renderer)
             base_writer = self._vector_renderer.writer
-            # self._renderer.finalize()
 
-            # Read this document and parse out all SVG groups.
-            # This will help us detect if an artist that we haven't
+            # These group ids will help us detect if an artist that we haven't
             # encountered before gets drawn. These artists are problematic
             # because the SVG group associated with them won't be in the
             # base document so we won't be able to update it properly.
@@ -350,17 +376,25 @@ class SVGFuncAnimation:
             # the artists returned by the user's func
             for framedata in self._iter_gen:
                 drawn_artists = {}
-                for artist in self._func(framedata, *self._args):
-                    # artist_gid = str(hash(artist))
+
+                # Get all artists that the user returned, if there
+                # aren't any, find all artists in the figure that are stale
+                # and redraw those
+                artists = self._func(framedata, *self._args)
+                artists = self._validate_artists(artists, name='animation function')
+
+                # if not artists:
+                #     artists = filter(lambda a: a.stale, get_all_children(self._fig))
+
+                for artist in artists:
                     artist_gid = artist.get_gid()
 
                     # Check that this artist is known
                     if artist_gid not in known_groups:
                         raise ValueError(f'Artist {artist}, with gid={artist.get_gid()}, not recognized.')
 
-                    # Note that there's some real "blitting" potential here,
-                    # We could figure out if the artist data changed at all
-                    # and not redraw if it didn't, for now let's redraw all.
+                    # By switching out the underlying writer we can capture the
+                    # new data but any new defs get captured by the base document.
                     with StringIO() as artist_f:
                         writer = XMLWriter(artist_f)
                         self._vector_renderer.writer = writer
@@ -371,9 +405,9 @@ class SVGFuncAnimation:
                     drawn_artists[artist_gid] = drawn_artist
                 self._embedded_frames.append(drawn_artists)
 
+            # Swap back in the original writer and finalize to get all defs.
             self._vector_renderer.writer = base_writer
             self._renderer.finalize()
-
             self._base_document = f.getvalue()
 
     def grab_frame(self, index):
