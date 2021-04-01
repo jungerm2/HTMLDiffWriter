@@ -284,6 +284,11 @@ class SVGFuncAnimation:
         self._vector_renderer = None
         self._renderer = None
 
+        if not self._blit:
+            raise NotImplementedError('SVGFuncAnimation requires the provided animation '
+                                      'function to return the artists it has changed, blitting '
+                                      'must be enabled.')
+
     @staticmethod
     def _find_by_attr(dom, value, attr='id', return_child=True):
         # this could be done better with a more advanced XML parser but has been
@@ -303,7 +308,7 @@ class SVGFuncAnimation:
                     if retval:
                         return retval
 
-    def _validate_artists(self, artists, name='animation function'):
+    def _validate_artists(self, artists, name='animation function', set_animated=False):
         # Both `_init_func` and `_func` should return an iterable of artists
         # if blit is True. Otherwise the return value is not used.
         if self._blit:
@@ -320,8 +325,12 @@ class SVGFuncAnimation:
                 if not isinstance(i, Artist):
                     raise err
 
-            # for a in artists:
-            #     a.set_animated(self._blit)
+            if set_animated:
+                for a in artists:
+                    a.set_animated(self._blit)
+
+            if not artists:
+                raise err
 
             return sorted(artists, key=lambda x: x.get_zorder())
         return []
@@ -335,13 +344,18 @@ class SVGFuncAnimation:
         self._renderer = None
 
         with StringIO() as f:
-            # Init figure by adding all artists returned by init_func
+            # Init figure by adding all artists returned by init_func to the figure
+            # And marking them as visible and not animated. This makes sure they get
+            # drawn in the first frame. We later mark them as animated for better blitting.
             if self._init_func:
                 init_artists = self._init_func()
-                init_artists = self._validate_artists(init_artists, name='init_func')
+                init_artists = self._validate_artists(init_artists, name='init_func', set_animated=False)
                 for artist in init_artists:
                     self._fig.add_artist(artist)
+                    artist.set_animated(False)
                     artist.set_visible(True)
+            else:
+                init_artists = []
 
             # Set the gid of every artist to a uuid, the idea here is that
             # when an artist is drawn in SVG it will be encased in a group with
@@ -366,6 +380,9 @@ class SVGFuncAnimation:
             self._fig.draw(self._renderer)
             base_writer = self._vector_renderer.writer
 
+            for artist in init_artists:
+                artist.set_animated(self._blit)
+
             # These group ids will help us detect if an artist that we haven't
             # encountered before gets drawn. These artists are problematic
             # because the SVG group associated with them won't be in the
@@ -381,17 +398,15 @@ class SVGFuncAnimation:
                 # aren't any, find all artists in the figure that are stale
                 # and redraw those
                 artists = self._func(framedata, *self._args)
-                artists = self._validate_artists(artists, name='animation function')
-
-                # if not artists:
-                #     artists = filter(lambda a: a.stale, get_all_children(self._fig))
+                artists = self._validate_artists(artists, name='animation function', set_animated=True)
 
                 for artist in artists:
                     artist_gid = artist.get_gid()
 
                     # Check that this artist is known
                     if artist_gid not in known_groups:
-                        raise ValueError(f'Artist {artist}, with gid={artist.get_gid()}, not recognized.')
+                        raise ValueError(f'Artist {artist}, with gid={artist.get_gid()}, not recognized. '
+                                         f'This usually occurs when the animation function returns a new artist.')
 
                     # By switching out the underlying writer we can capture the
                     # new data but any new defs get captured by the base document.

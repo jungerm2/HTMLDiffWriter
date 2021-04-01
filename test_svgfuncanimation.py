@@ -157,9 +157,14 @@ def test_text_animation(tmpdir, math_mode, index):
 #   [x] Test grab_frame returns valid XML doc
 #   [x] Test init_func vs no init_func
 #   [ ] Test user func returns unknown artist
+#       - This currently throws an error, can we instead redraw the whole
+#         thing, figure out what's changed and only emit a (performance) warning?
 #   [ ] Test user func returns None
 #       - Is this something we should support?
 #         We would need to track what artists changed, OR redraw all...
+#           * We can set everything in the figure to animated and then redraw all
+#             artists that are stale, visible and aren't empty Text artists. This
+#             kinda works but probably isn't really viable.
 #   [ ] Test artist with no initial draw (i.e: Text w/ empty str)
 #   -----------------------
 #   Refactor tests w/ better fixtures + skip_ifs (if needed?)
