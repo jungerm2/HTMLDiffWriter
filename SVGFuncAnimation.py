@@ -1,3 +1,5 @@
+import itertools
+import logging
 import uuid
 from pathlib import Path
 from html import unescape
@@ -6,8 +8,13 @@ from functools import lru_cache
 from tempfile import TemporaryDirectory
 from io import StringIO
 
-from matplotlib.backends.backend_svg import MixedModeRenderer, RendererSVG, XMLWriter, svgProlog
+import numpy as np
+import matplotlib as mpl
+from matplotlib.backends.backend_svg import MixedModeRenderer, RendererSVG, XMLWriter
 from matplotlib.artist import Artist
+from matplotlib import _api
+
+_log = logging.getLogger(__name__)
 
 
 # Javascript template for HTMLWriter
@@ -269,28 +276,135 @@ def get_all_children(artist):
 
 
 class SVGFuncAnimation:
-    def __init__(self, fig, func, frames, init_func=None, fargs=None, default_mode='loop', interval=200, blit=True):
+    """
+    Makes an animation by repeatedly calling a function *func* which return modified artists.
+
+    Parameters
+    ----------
+    fig : `~matplotlib.figure.Figure`
+        The figure object used to get needed events, such as draw or resize.
+
+    func : callable
+        The function to call at each frame.  The first argument will
+        be the next value in *frames*.   Any additional positional
+        arguments can be supplied via the *fargs* parameter.
+
+        The required signature is::
+
+            def func(frame, *fargs) -> iterable_of_artists
+
+        *func* must return an iterable of all artists that were modified or
+        created. This information is used by the blitting algorithm to determine
+        which parts of the figure have to be updated.
+
+    frames : iterable, int, generator function, or None, optional
+        Source of data to pass *func* and each frame of the animation
+
+        - If an iterable, then simply use the values provided.  If the
+          iterable has a length, it will override the *save_count* kwarg.
+
+        - If an integer, then equivalent to passing ``range(frames)``
+
+        - If a generator function, then must have the signature::
+
+             def gen_function() -> obj
+
+        - If *None*, then equivalent to passing ``itertools.count``.
+
+        In all of these cases, the values in *frames* is simply passed through
+        to the user-supplied *func* and thus can be of any type.
+
+    init_func : callable, optional
+        A function used to draw a clear frame. If not given, the results of
+        drawing from the first item in the frames sequence will be used. This
+        function will be called once before the first frame.
+
+        The required signature is::
+
+            def init_func() -> iterable_of_artists
+
+        *init_func* must return an iterable of artists to be re-drawn. This
+        information is used by the blitting algorithm to determine which parts
+        of the figure have to be updated.
+
+    fargs : tuple or None, optional
+        Additional arguments to pass to each call to *func*.
+
+    fkwargs : dictionary or None, optional
+        Additional keyword arguments to pass to each call to *func*.
+
+    default_mode: one of 'loop', 'once', 'reflect'. default: 'loop'
+        Specifies the default end-of-animation behavior.
+
+    save_count : int, default: 100
+        Fallback for the number of values from *frames* to cache. This is
+        only used if the number of frames cannot be inferred from *frames*,
+        i.e. when it's an iterator without length or a generator.
+
+    interval : int, default: 200
+        Delay between frames in milliseconds.
+    """
+    def __init__(
+        self,
+        fig,
+        func,
+        frames,
+        init_func=None,
+        fargs=None,
+        fkwargs=None,
+        default_mode="loop",
+        save_count=100,
+        interval=200,
+        embed_limit=None,
+        blit=True,
+    ):
         self._fig = fig
         self._func = func
-        self._iter_gen = frames  # TODO: Deal with integers, and generators (with itertools.tee?)
         self._init_func = init_func
         self._args = fargs if fargs else ()
-        self._default_mode = default_mode
+        self._kwargs = fkwargs if fkwargs else {}
+        self._default_mode = default_mode.lower()
+        _api.check_in_list(['loop', 'once', 'reflect'], default_mode=self._default_mode)
+        self._save_count = save_count
         self._interval = interval
         self._blit = blit
-        self._html_representation = ''
+
+        self._total_bytes = 0
+        self._html_representation = ""
         self._base_document = None
         self._embedded_frames = []
         self._vector_renderer = None
         self._renderer = None
 
         if not self._blit:
-            raise NotImplementedError('SVGFuncAnimation requires the provided animation '
-                                      'function to return the artists it has changed, blitting '
-                                      'must be enabled.')
+            raise NotImplementedError(
+                "SVGFuncAnimation requires the provided animation "
+                "function to return the artists it has changed, blitting "
+                "must be enabled."
+            )
+
+        # Save embed limit, which is given in MB
+        if embed_limit is None:
+            self._bytes_limit = mpl.rcParams['animation.embed_limit']
+        else:
+            self._bytes_limit = embed_limit
+        # Convert from MB to bytes
+        self._bytes_limit *= 1024 * 1024
+
+        if frames is None:
+            self._iter_gen = lambda: iter(range(self._save_count))
+        elif callable(frames):
+            self._iter_gen = frames
+        elif np.iterable(frames):
+            self._iter_gen = lambda: iter(frames)
+            if hasattr(frames, '__len__'):
+                self._save_count = len(frames)
+        else:
+            self._iter_gen = lambda: iter(range(frames))
+            self._save_count = frames
 
     @staticmethod
-    def _find_by_attr(dom, value, attr='id', return_child=True):
+    def _find_by_attr(dom, value, attr="id", return_child=True):
         # this could be done better with a more advanced XML parser but has been
         # done like so to minimize external dependencies. ElementTree re-writes
         # and changes the namespaces so we use minidom instead.
@@ -302,18 +416,18 @@ class SVGFuncAnimation:
                     return index, dom
                 else:
                     retval = SVGFuncAnimation._find_by_attr(
-                        child, value, attr=attr,
-                        return_child=return_child
+                        child, value, attr=attr, return_child=return_child
                     )
                     if retval:
                         return retval
 
-    def _validate_artists(self, artists, name='animation function', set_animated=False):
+    def _validate_artists(self, artists, name="animation function", set_animated=False):
         # Both `_init_func` and `_func` should return an iterable of artists
         # if blit is True. Otherwise the return value is not used.
         if self._blit:
-            err = RuntimeError(f'The {name} must return a sequence '
-                               'of Artist objects.')
+            err = RuntimeError(
+                f"The {name} must return a sequence " "of Artist objects."
+            )
             try:
                 # check if a sequence
                 iter(artists)
@@ -349,7 +463,9 @@ class SVGFuncAnimation:
             # drawn in the first frame. We later mark them as animated for better blitting.
             if self._init_func:
                 init_artists = self._init_func()
-                init_artists = self._validate_artists(init_artists, name='init_func', set_animated=False)
+                init_artists = self._validate_artists(
+                    init_artists, name="init_func", set_animated=False
+                )
                 for artist in init_artists:
                     self._fig.add_artist(artist)
                     artist.set_animated(False)
@@ -362,7 +478,7 @@ class SVGFuncAnimation:
             # an id equal to the artist's gid and the gid of an artist doesn't
             # change when the artist's data changes.
             for artist in get_all_children(self._fig):
-                artist.set_gid(f'{artist.__class__.__name__}_{uuid.uuid4().hex}')
+                artist.set_gid(f"{artist.__class__.__name__}_{uuid.uuid4().hex}")
 
             # Now we can save the initial figure, without finalizing it's renderer.
             # This keeps the renderer._defs from being written until we know all of them.
@@ -374,8 +490,8 @@ class SVGFuncAnimation:
 
             self._vector_renderer = RendererSVG(w, h, f, None, dpi)
             self._renderer = MixedModeRenderer(
-                self._fig, width, height, dpi,
-                self._vector_renderer)
+                self._fig, width, height, dpi, self._vector_renderer
+            )
 
             self._fig.draw(self._renderer)
             base_writer = self._vector_renderer.writer
@@ -391,22 +507,26 @@ class SVGFuncAnimation:
 
             # Get all subsequent frames by only drawing
             # the artists returned by the user's func
-            for framedata in self._iter_gen:
+            for framedata in self._iter_gen():
                 drawn_artists = {}
 
                 # Get all artists that the user returned, if there
                 # aren't any, find all artists in the figure that are stale
                 # and redraw those
-                artists = self._func(framedata, *self._args)
-                artists = self._validate_artists(artists, name='animation function', set_animated=True)
+                artists = self._func(framedata, *self._args, **self._kwargs)
+                artists = self._validate_artists(
+                    artists, name="animation function", set_animated=True
+                )
 
                 for artist in artists:
                     artist_gid = artist.get_gid()
 
                     # Check that this artist is known
                     if artist_gid not in known_groups:
-                        raise ValueError(f'Artist {artist}, with gid={artist.get_gid()}, not recognized. '
-                                         f'This usually occurs when the animation function returns a new artist.')
+                        raise ValueError(
+                            f"Artist {artist}, with gid={artist.get_gid()}, not recognized. "
+                            f"This usually occurs when the animation function returns a new artist."
+                        )
 
                     # By switching out the underlying writer we can capture the
                     # new data but any new defs get captured by the base document.
@@ -416,9 +536,20 @@ class SVGFuncAnimation:
 
                         self._fig.draw_artist(artist)
                         drawn_artist = artist_f.getvalue()
+                        self._total_bytes += len(drawn_artist)
 
                     drawn_artists[artist_gid] = drawn_artist
-                self._embedded_frames.append(drawn_artists)
+
+                if self._total_bytes >= self._bytes_limit:
+                    _log.warning(
+                        "Animation size has reached %s bytes, exceeding the limit "
+                        "of %s. If you're sure you want a larger animation "
+                        "embedded, set the animation.embed_limit rc parameter to "
+                        "a larger value (in MB). This and further frames will be "
+                        "dropped.", self._total_bytes, self._bytes_limit)
+                    break
+                else:
+                    self._embedded_frames.append(drawn_artists)
 
             # Swap back in the original writer and finalize to get all defs.
             self._vector_renderer.writer = base_writer
@@ -437,17 +568,21 @@ class SVGFuncAnimation:
 
     def save(self, filename):
         self.grab_frames()
-        mode_dict = dict(once_checked='', loop_checked='', reflect_checked='')
-        mode_dict[self._default_mode + '_checked'] = 'checked'
+        mode_dict = dict(once_checked="", loop_checked="", reflect_checked="")
+        mode_dict[self._default_mode + "_checked"] = "checked"
 
-        with open(filename, 'w', encoding='utf-8') as of:
+        with open(filename, "w", encoding="utf-8") as of:
             of.write(JS_INCLUDE + STYLE_INCLUDE)
-            of.write(DISPLAY_TEMPLATE.format(id=uuid.uuid4().hex,
-                                             Nframes=len(self._embedded_frames),
-                                             fill_frames=self._embedded_frames,
-                                             base_document=self._base_document,
-                                             interval=self._interval,
-                                             **mode_dict))
+            of.write(
+                DISPLAY_TEMPLATE.format(
+                    id=uuid.uuid4().hex,
+                    Nframes=len(self._embedded_frames),
+                    fill_frames=self._embedded_frames,
+                    base_document=self._base_document,
+                    interval=self._interval,
+                    **mode_dict,
+                )
+            )
 
     def to_jshtml(self):
         if not self._html_representation:
